@@ -29,11 +29,12 @@ PUBLIC KERNEL(MoeRouterTopK)(
     const constant uint& num_experts,
     const constant uint& top_k,
     const constant uint& batch_size,
+    const constant uint& logit_stride,
     const bool has_biases SPECIALIZE,
     const uint token_idx GROUPS(batch_size),
     const uint lane THREADS(METAL_SIMD_SIZE)
 ) {
-  const device T* row = logits + token_idx * num_experts;
+  const device T* row = logits + token_idx * logit_stride;
   float vals[MOE_ROUTER_MAX_PER_LANE];
   for (uint i = 0; i < MOE_ROUTER_MAX_PER_LANE; ++i) {
     const uint e = lane + i * METAL_SIMD_SIZE;
@@ -281,11 +282,12 @@ PUBLIC KERNEL(MoeCombine)(
     const device T* expert_outputs,
     const device float* expert_weights,
     const device T* shared_output OPTIONAL(has_shared),
-    const device T* shared_gate OPTIONAL(has_gate),
+    const device float* shared_gate OPTIONAL(has_gate),
     device T* output,
     const constant uint& model_dim,
     const constant uint& top_k,
     const constant uint& batch_size,
+    const constant uint& gate_stride,
     const bool has_shared SPECIALIZE,
     const bool has_gate SPECIALIZE,
     const uint col AXIS(model_dim, 256),
@@ -302,7 +304,7 @@ PUBLIC KERNEL(MoeCombine)(
   if (has_shared) {
     float s_val = float(shared_output[token_idx * model_dim + col]);
     if (has_gate) {
-      s_val = attention_apply_gate(s_val, float(shared_gate[token_idx]));
+      s_val = attention_apply_gate(s_val, float(shared_gate[token_idx * gate_stride]));
     }
     acc += s_val;
   }
