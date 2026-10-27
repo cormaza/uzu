@@ -32,6 +32,7 @@ pub use model_info::ChatModelInfo;
 use nagare::{
     chat::{ChatInstance, ChatSession},
     classification::ClassificationSession,
+    decision::DecisionSession,
     text_to_speech::TextToSpeechSession,
 };
 use shoji::{
@@ -669,6 +670,22 @@ impl Engine {
             let backends = self.backends.lock().await;
             let backend = backends.get(&backend.identifier).ok_or(EngineError::BackendNotFound {})?;
             let session = ClassificationSession::new(backend.clone(), model, path).await?;
+            Ok(session)
+        } else {
+            Err(EngineError::BackendNotFound {})
+        }
+    }
+
+    #[bindings::export(Method)]
+    pub async fn decision(
+        &self,
+        model: Model,
+    ) -> Result<DecisionSession, EngineError> {
+        let path = self.model_path(&model).await;
+        if let Some(backend) = model.backends.first() {
+            let backends = self.backends.lock().await;
+            let backend = backends.get(&backend.identifier).ok_or(EngineError::BackendNotFound {})?;
+            let session = DecisionSession::new(backend.clone(), model, path).await?;
             Ok(session)
         } else {
             Err(EngineError::BackendNotFound {})

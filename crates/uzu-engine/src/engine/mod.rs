@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub mod classifier_model;
+pub mod decision_model;
 pub mod language_model;
 
 pub struct Engine<B: Backend> {
@@ -48,6 +49,7 @@ impl<B: Backend> Engine<B> {
 pub enum ModelType {
     LanguageModel,
     Classifier,
+    Decision,
 }
 
 #[derive(Debug, Error)]
@@ -60,7 +62,13 @@ pub enum ResolveModelTypeError {
 
 pub fn resolve_model_type(model_path: &Path) -> Result<ModelType, ResolveModelTypeError> {
     Ok(match read_model_config(model_path)? {
-        AnyModelConfig::LanguageModelConfig(_) => ModelType::LanguageModel,
+        AnyModelConfig::LanguageModelConfig(config) => {
+            if config.decision.is_some() {
+                ModelType::Decision
+            } else {
+                ModelType::LanguageModel
+            }
+        },
         AnyModelConfig::ClassifierModelConfig(_) => ModelType::Classifier,
     })
 }
