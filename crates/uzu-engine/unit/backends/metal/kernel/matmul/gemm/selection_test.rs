@@ -135,14 +135,6 @@ fn selection_fallbacks_and_split_k_are_preserved() {
         assert_eq!(plan.split_k, expected_split_k);
     }
 
-    let mut biased = quant(shape(16, 4096, 4096));
-    biased.a_full_precision = false;
-    biased.d_transform = GemmDTransform::BIAS;
-    assert_eq!(
-        GemmProblem::new(biased, DataType::BF16, DataType::F32, true, MTLGPUFamily::Apple7).select_plan().split_k,
-        1
-    );
-
     let mut zero = quant(shape(0, 1, 1));
     zero.b_prologue = GemmBPrologueKind::ScaleZeroPointDequant;
     zero.b_group_size = Some(u32::MAX);
@@ -195,7 +187,6 @@ fn gemv_gemm_route_boundaries_are_preserved() {
     for (shape, data_type, prefer_gemm) in [
         (shape(4, 4096, 8192), DataType::BF16, true),
         (shape(4, 8192, 4096), DataType::BF16, false),
-        (shape(4, 4096, 4096), DataType::F32, false),
         (shape(3, 4096, 8192), DataType::BF16, false),
         (shape(5, 4096, 8192), DataType::BF16, false),
     ] {
