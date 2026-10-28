@@ -14,7 +14,7 @@ pub type HipFunctionT = *mut c_void;
 pub const HIP_SUCCESS: HipErrorT = 0;
 pub const HIP_MEMCPY_DEFAULT: c_uint = 4;
 pub const HIP_HOST_MALLOC_MAPPED: c_uint = 0x02;
-pub const HIP_HOST_MALLOC_COHERENT: c_uint = 0x40000000;
+pub const HIP_HOST_MALLOC_NON_COHERENT: c_uint = 0x80000000;
 
 type HipInitFn = unsafe extern "C" fn(flags: c_uint) -> HipErrorT;
 type HipGetDeviceCountFn = unsafe extern "C" fn(count: *mut c_int) -> HipErrorT;
@@ -175,8 +175,11 @@ impl HipRuntime {
         let padded_size = size.max(64).next_multiple_of(64);
         unsafe {
             let mut host_ptr: *mut c_void = std::ptr::null_mut();
-            let mut err =
-                (self.hip_host_malloc)(&mut host_ptr, padded_size, HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT);
+            let mut err = (self.hip_host_malloc)(
+                &mut host_ptr,
+                padded_size,
+                HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_NON_COHERENT,
+            );
             if err != HIP_SUCCESS || host_ptr.is_null() {
                 err = (self.hip_host_malloc)(&mut host_ptr, padded_size, HIP_HOST_MALLOC_MAPPED);
             }

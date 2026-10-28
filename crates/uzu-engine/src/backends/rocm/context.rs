@@ -37,8 +37,15 @@ pub struct RocmHipKernels {
     pub qkv_norm: HipFunction,
     pub kv_cache_update: HipFunction,
     pub gated_act_mul_fp: HipFunction,
+    pub gated_act_mul_quant: HipFunction,
     pub attention_single_pass: HipFunction,
+    pub attention_prepare: HipFunction,
     pub input_embedding_lookup_dense: HipFunction,
+    pub input_embedding_lookup_quant: HipFunction,
+    pub activation_transform: HipFunction,
+    pub short_conv_pack: HipFunction,
+    pub short_conv_prefill: HipFunction,
+    pub short_conv_decode: HipFunction,
 }
 
 impl RocmHipKernels {
@@ -59,8 +66,15 @@ impl RocmHipKernels {
             qkv_norm: module.get_function("rocm_qkv_norm")?,
             kv_cache_update: module.get_function("rocm_kv_cache_update")?,
             gated_act_mul_fp: module.get_function("rocm_gated_act_mul_fp")?,
+            gated_act_mul_quant: module.get_function("rocm_gated_act_mul_quant")?,
             attention_single_pass: module.get_function("rocm_attention_single_pass")?,
+            attention_prepare: module.get_function("rocm_attention_prepare")?,
             input_embedding_lookup_dense: module.get_function("rocm_input_embedding_lookup_dense")?,
+            input_embedding_lookup_quant: module.get_function("rocm_input_embedding_lookup_quant")?,
+            activation_transform: module.get_function("rocm_activation_transform")?,
+            short_conv_pack: module.get_function("rocm_short_conv_pack")?,
+            short_conv_prefill: module.get_function("rocm_short_conv_prefill")?,
+            short_conv_decode: module.get_function("rocm_short_conv_decode")?,
             _module: module,
         })
     }

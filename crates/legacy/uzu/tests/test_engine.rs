@@ -135,6 +135,7 @@ async fn test_engine_text_to_speech() {
 
 #[tokio::test]
 async fn test_rocm_engine_and_mirai_registry() {
+    use tokio_stream::StreamExt;
     use uzu_engine::backends::{Backend, BackendSelection, select_backend};
 
     struct CheckBackend;
@@ -157,15 +158,41 @@ async fn test_rocm_engine_and_mirai_registry() {
     let config = EngineConfig::default();
     let engine = Engine::new(config).await.expect("Engine::new failed on Linux with ROCm backend");
 
+    let mut updates = engine.catalog_subscribe();
+    while engine.catalog_is_refreshing() {
+        if updates.next().await.is_none() {
+            break;
+        }
+    }
+
     let models = engine.models().await.expect("engine.models() failed");
     println!("Resolved {} models from MiraiRegistry on Linux ROCm", models.len());
     assert!(!models.is_empty(), "Expected non-empty model catalog from MiraiRegistry");
 
-    let model = engine
+    let lfm_models: Vec<_> = models.iter().filter(|m| m.identifier.starts_with("liquidai:")).collect();
+    println!("Resolved {} Liquid AI (LFM) models:", lfm_models.len());
+    for m in &lfm_models {
+        println!("  - {} ({})", m.identifier, m.name());
+    }
+    assert!(!lfm_models.is_empty(), "Expected Liquid AI (LFM) models in MiraiRegistry catalog");
+
+    let lfm_model = engine
+        .model("liquidai:lfm2.5:230m:mirai:mirai-m:4".to_string())
+        .await
+        .expect("engine.model lookup failed")
+        .expect("Expected liquidai:lfm2.5:230m:mirai:mirai-m:4 in MiraiRegistry");
+    println!(
+        "Resolved LFM model: id={}, name={}, repo_ids={:?}",
+        lfm_model.identifier,
+        lfm_model.name(),
+        lfm_model.repo_ids()
+    );
+    assert_eq!(lfm_model.identifier, "liquidai:lfm2.5:230m:mirai:mirai-m:4");
+
+    let qwen_model = engine
         .model("alibaba:qwen3.5:0.8b:mirai:mirai-m:4".to_string())
         .await
         .expect("engine.model lookup failed")
         .expect("Expected alibaba:qwen3.5:0.8b:mirai:mirai-m:4 in MiraiRegistry");
-    println!("Resolved model: id={}, name={}, repo_ids={:?}", model.identifier, model.name(), model.repo_ids());
-    assert_eq!(model.identifier, "alibaba:qwen3.5:0.8b:mirai:mirai-m:4");
+    assert_eq!(qwen_model.identifier, "alibaba:qwen3.5:0.8b:mirai:mirai-m:4");
 }

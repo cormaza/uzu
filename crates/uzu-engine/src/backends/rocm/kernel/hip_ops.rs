@@ -5,8 +5,9 @@ use crate::{
         common::{
             CommandBufferEncoding,
             gpu_types::{
-                activation_type::ActivationType, embedding::EmbeddingTableKind, gated_act_mul::GatedActMulOp,
-                kv_cache_update::Copy, ring::RingParams,
+                activation_transform::ActivationTransformOp, activation_type::ActivationType,
+                embedding::EmbeddingTableKind, gated_act_mul::GatedActMulOp, kv_cache_update::Copy,
+                quantization::QuantizationMode, quantization_method::QuantizationMethod, ring::RingParams,
             },
         },
         rocm::{
@@ -14,7 +15,9 @@ use crate::{
             command_buffer::RocmCommandBufferEncoding,
             kernel::{
                 activation::activation::ActivationRocmKernel,
+                activation_transform::activation_transform::ActivationTransformRocmKernel,
                 attention::{
+                    attention_prepare::AttentionPrepareRocmKernel,
                     attention_single_pass::AttentionSinglePassRocmKernel, kv_cache_update::KVCacheUpdateRocmKernel,
                     qkv_norm::QKVNormRocmKernel, sigmoid_gate::SigmoidGateRocmKernel,
                 },
@@ -23,6 +26,9 @@ use crate::{
                 logit_transform::logit_transform::LogitTransformRocmKernel,
                 normalization::normalization::NormalizationRocmKernel,
                 pooling::pooling::PoolingMeanRocmKernel,
+                short_conv::short_conv::{
+                    ShortConvDecodeRocmKernel, ShortConvPackRocmKernel, ShortConvPrefillRocmKernel,
+                },
                 softmax::softmax::SoftmaxRocmKernel,
                 tensor_add_bias::tensor_add_bias::TensorAddBiasRocmKernel,
                 tensor_add_scale::tensor_add_scale::TensorAddScaleRocmKernel,
@@ -542,9 +548,9 @@ pub(crate) fn try_encode_gated_act_mul(
     act_operand: SendPtr<u8>,
     value_operand: Option<SendPtr<u8>>,
     fp_out: Option<SendPtrMut<u8>>,
-    _q_out: Option<SendPtrMut<u8>>,
-    _scales_out: Option<SendPtrMut<u8>>,
-    _group_sums_out: Option<SendPtrMut<u8>>,
+    q_out: Option<SendPtrMut<u8>>,
+    scales_out: Option<SendPtrMut<u8>>,
+    group_sums_out: Option<SendPtrMut<u8>>,
     hadamard_factors: Option<SendPtr<u8>>,
     gated_dim: u32,
     batch_dim: u32,
@@ -558,13 +564,7 @@ pub(crate) fn try_encode_gated_act_mul(
     value_clip_max: Option<f32>,
     command_buffer: &mut RocmCommandBufferEncoding,
 ) -> bool {
-    if kernel.ops != GatedActMulOp::FullPrecision {
-        return false;
-    }
     let Some(dtype) = dtype_code(kernel.T) else {
-        return false;
-    };
-    let Some(fp_out) = fp_out else {
         return false;
     };
     let val_ptr = value_operand.unwrap_or(SendPtr(std::ptr::null()));
@@ -575,6 +575,92 @@ pub(crate) fn try_encode_gated_act_mul(
     let g_max = gate_clip_max.unwrap_or(f32::INFINITY);
     let v_min = value_clip_min.unwrap_or(f32::NEG_INFINITY);
     let v_max = value_clip_max.unwrap_or(f32::INFINITY);
+
+    if kernel.ops != GatedActMulOp::FullPrecision {
+        let scale_group_size = kernel.activation_scale_group_size;
+        let sum_group_size = kernel.sum_group_size;
+        let emit_group_sums = kernel.ops == GatedActMulOp::QuantizeWithGroupSums;
+        if !kernel.use_hadamard
+            || scale_group_size == 0
+            || scale_group_size > 256
+            || !scale_group_size.is_multiple_of(32)
+            || !gated_dim.is_multiple_of(scale_group_size)
+            || (emit_group_sums
+                && (sum_group_size == 0
+                    || scale_group_size < sum_group_size
+                    || !scale_group_size.is_multiple_of(sum_group_size)))
+        {
+            return false;
+        }
+        let (Some(q_out), Some(scales_out)) = (q_out, scales_out) else {
+            return false;
+        };
+        let sums_ptr = group_sums_out.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+        let flags = u32::from(kernel.interleaved)
+            | (u32::from(kernel.use_hadamard) << 1)
+            | (u32::from(kernel.custom_activation_alpha) << 2)
+            | (u32::from(kernel.clip_gate) << 3)
+            | (u32::from(kernel.clip_value) << 4)
+            | (u32::from(emit_group_sums) << 5)
+            | (u32::from(kernel.grouped_by_weight_nibble) << 6);
+        let func = command_buffer.context().kernels.gated_act_mul_quant;
+
+        command_buffer.push_gpu_command(move |stream| unsafe {
+            let mut p_act = act_operand.as_ptr() as *const c_void;
+            let mut p_val = val_ptr.as_ptr() as *const c_void;
+            let mut p_qout = q_out.as_ptr() as *mut c_void;
+            let mut p_sout = scales_out.as_ptr() as *mut c_void;
+            let mut p_gsum = sums_ptr.as_ptr() as *mut c_void;
+            let mut p_had = had_ptr.as_ptr() as *const c_void;
+            let mut p_gdim = gated_dim;
+            let mut p_bdim = batch_dim;
+            let mut p_voff = value_offset;
+            let mut p_vstr = value_row_stride;
+            let mut p_sgs = scale_group_size;
+            let mut p_sumgs = sum_group_size;
+            let mut p_atype = act_code;
+            let mut p_alpha = alpha;
+            let mut p_gmin = g_min;
+            let mut p_gmax = g_max;
+            let mut p_vmin = v_min;
+            let mut p_vmax = v_max;
+            let mut p_dtype = dtype;
+            let mut p_flags = flags;
+            let mut params: [*mut c_void; 20] = [
+                (&mut p_act as *mut *const c_void).cast(),
+                (&mut p_val as *mut *const c_void).cast(),
+                (&mut p_qout as *mut *mut c_void).cast(),
+                (&mut p_sout as *mut *mut c_void).cast(),
+                (&mut p_gsum as *mut *mut c_void).cast(),
+                (&mut p_had as *mut *const c_void).cast(),
+                (&mut p_gdim as *mut u32).cast(),
+                (&mut p_bdim as *mut u32).cast(),
+                (&mut p_voff as *mut u32).cast(),
+                (&mut p_vstr as *mut u32).cast(),
+                (&mut p_sgs as *mut u32).cast(),
+                (&mut p_sumgs as *mut u32).cast(),
+                (&mut p_atype as *mut u32).cast(),
+                (&mut p_alpha as *mut f32).cast(),
+                (&mut p_gmin as *mut f32).cast(),
+                (&mut p_gmax as *mut f32).cast(),
+                (&mut p_vmin as *mut f32).cast(),
+                (&mut p_vmax as *mut f32).cast(),
+                (&mut p_dtype as *mut u32).cast(),
+                (&mut p_flags as *mut u32).cast(),
+            ];
+            let total = batch_dim.saturating_mul(gated_dim / scale_group_size);
+            let block = 128u32;
+            let grid = total.div_ceil(block);
+            stream
+                .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                .expect("rocm_gated_act_mul_quant failed");
+        });
+        return true;
+    }
+
+    let Some(fp_out) = fp_out else {
+        return false;
+    };
     let flags = u32::from(kernel.interleaved)
         | (u32::from(kernel.use_hadamard) << 1)
         | (u32::from(kernel.custom_activation_alpha) << 2)
@@ -626,6 +712,372 @@ pub(crate) fn try_encode_gated_act_mul(
         let block = 128u32;
         let grid = total.div_ceil(block);
         stream.launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params).expect("rocm_gated_act_mul_fp failed");
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_activation_transform(
+    kernel: &ActivationTransformRocmKernel,
+    input: Option<SendPtr<u8>>,
+    fp_out: Option<SendPtrMut<u8>>,
+    bias: Option<SendPtr<u8>>,
+    q_out: Option<SendPtrMut<u8>>,
+    scales_out: Option<SendPtrMut<u8>>,
+    group_sums_out: Option<SendPtrMut<u8>>,
+    rht_factors: SendPtr<u8>,
+    batch_size: u32,
+    element_count: u32,
+    command_buffer: &mut RocmCommandBufferEncoding,
+) -> bool {
+    let (Some(t_dtype), Some(bias_dtype)) = (dtype_code(kernel.T), dtype_code(kernel.BiasT)) else {
+        return false;
+    };
+    if element_count == 0 || !element_count.is_multiple_of(32) {
+        return false;
+    }
+    let quantize =
+        matches!(kernel.ops, ActivationTransformOp::Quantize | ActivationTransformOp::QuantizeWithGroupSums);
+    let emit_group_sums = kernel.ops == ActivationTransformOp::QuantizeWithGroupSums;
+    let scale_group_size = kernel.activation_scale_group_size;
+    let sum_group_size = kernel.sum_group_size;
+
+    if quantize
+        && (scale_group_size == 0
+            || scale_group_size > 256
+            || !scale_group_size.is_multiple_of(32)
+            || !element_count.is_multiple_of(scale_group_size)
+            || (emit_group_sums
+                && (sum_group_size == 0
+                    || scale_group_size < sum_group_size
+                    || !scale_group_size.is_multiple_of(sum_group_size))))
+    {
+        return false;
+    }
+
+    let in_ptr = if kernel.in_place {
+        let Some(ref fp_out) = fp_out else {
+            return false;
+        };
+        SendPtr(fp_out.as_ptr().cast_const())
+    } else {
+        let Some(input) = input else {
+            return false;
+        };
+        input
+    };
+    let fp_ptr = fp_out.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+    let bias_ptr = bias.unwrap_or(SendPtr(std::ptr::null()));
+    let q_ptr = q_out.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+    let sc_ptr = scales_out.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+    let gs_ptr = group_sums_out.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+
+    let input_rht = kernel.ops != ActivationTransformOp::OutputRht;
+    let flags = u32::from(input_rht)
+        | (u32::from(quantize) << 1)
+        | (u32::from(emit_group_sums) << 2)
+        | (u32::from(kernel.grouped_by_weight_nibble) << 3)
+        | (u32::from(kernel.has_bias) << 4);
+    let func = command_buffer.context().kernels.activation_transform;
+
+    command_buffer.push_gpu_command(move |stream| unsafe {
+        let mut p_in = in_ptr.as_ptr() as *const c_void;
+        let mut p_fp = fp_ptr.as_ptr() as *mut c_void;
+        let mut p_bias = bias_ptr.as_ptr() as *const c_void;
+        let mut p_q = q_ptr.as_ptr() as *mut c_void;
+        let mut p_sc = sc_ptr.as_ptr() as *mut c_void;
+        let mut p_gs = gs_ptr.as_ptr() as *mut c_void;
+        let mut p_rht = rht_factors.as_ptr() as *const c_void;
+        let mut p_bs = batch_size;
+        let mut p_ec = element_count;
+        let mut p_sgs = scale_group_size;
+        let mut p_sumgs = sum_group_size;
+        let mut p_td = t_dtype;
+        let mut p_bd = bias_dtype;
+        let mut p_fl = flags;
+        let mut params: [*mut c_void; 14] = [
+            (&mut p_in as *mut *const c_void).cast(),
+            (&mut p_fp as *mut *mut c_void).cast(),
+            (&mut p_bias as *mut *const c_void).cast(),
+            (&mut p_q as *mut *mut c_void).cast(),
+            (&mut p_sc as *mut *mut c_void).cast(),
+            (&mut p_gs as *mut *mut c_void).cast(),
+            (&mut p_rht as *mut *const c_void).cast(),
+            (&mut p_bs as *mut u32).cast(),
+            (&mut p_ec as *mut u32).cast(),
+            (&mut p_sgs as *mut u32).cast(),
+            (&mut p_sumgs as *mut u32).cast(),
+            (&mut p_td as *mut u32).cast(),
+            (&mut p_bd as *mut u32).cast(),
+            (&mut p_fl as *mut u32).cast(),
+        ];
+        let total = if quantize {
+            batch_size.saturating_mul(element_count / scale_group_size)
+        } else {
+            batch_size.saturating_mul(element_count / 32)
+        };
+        let block = 128u32;
+        let grid = total.div_ceil(block);
+        stream
+            .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+            .expect("rocm_activation_transform failed");
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_short_conv_pack(
+    kernel: &ShortConvPackRocmKernel,
+    state_in: SendPtr<u8>,
+    in_proj: SendPtr<u8>,
+    padded: SendPtrMut<u8>,
+    state_stride: u32,
+    suffix_len: u32,
+    in_proj_stride: u32,
+    model_dim: u32,
+    command_buffer: &mut RocmCommandBufferEncoding,
+) -> bool {
+    let Some(dtype) = dtype_code(kernel.T) else {
+        return false;
+    };
+    let func = command_buffer.context().kernels.short_conv_pack;
+
+    command_buffer.push_gpu_command(move |stream| unsafe {
+        let mut p_st = state_in.as_ptr() as *const c_void;
+        let mut p_in = in_proj.as_ptr() as *const c_void;
+        let mut p_pad = padded.as_ptr() as *mut c_void;
+        let mut p_ss = state_stride;
+        let mut p_sl = suffix_len;
+        let mut p_ips = in_proj_stride;
+        let mut p_md = model_dim;
+        let mut p_dt = dtype;
+        let mut params: [*mut c_void; 8] = [
+            (&mut p_st as *mut *const c_void).cast(),
+            (&mut p_in as *mut *const c_void).cast(),
+            (&mut p_pad as *mut *mut c_void).cast(),
+            (&mut p_ss as *mut u32).cast(),
+            (&mut p_sl as *mut u32).cast(),
+            (&mut p_ips as *mut u32).cast(),
+            (&mut p_md as *mut u32).cast(),
+            (&mut p_dt as *mut u32).cast(),
+        ];
+        let total = (state_stride.saturating_add(suffix_len)).saturating_mul(model_dim);
+        let block = 128u32;
+        let grid = total.div_ceil(block);
+        stream.launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params).expect("rocm_short_conv_pack failed");
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_short_conv_prefill(
+    kernel: &ShortConvPrefillRocmKernel,
+    padded: SendPtr<u8>,
+    in_proj: SendPtr<u8>,
+    w: SendPtr<u8>,
+    b: Option<SendPtr<u8>>,
+    out: SendPtrMut<u8>,
+    state_out: SendPtrMut<u8>,
+    suffix_len: u32,
+    kernel_size: u32,
+    in_proj_stride: u32,
+    state_stride: u32,
+    model_dim: u32,
+    command_buffer: &mut RocmCommandBufferEncoding,
+) -> bool {
+    if kernel.WeightT != DataType::F32 {
+        return false;
+    }
+    let Some(dtype) = dtype_code(kernel.T) else {
+        return false;
+    };
+    let b_ptr = b.unwrap_or(SendPtr(std::ptr::null()));
+    let has_bias = u32::from(kernel.has_bias);
+    let func = command_buffer.context().kernels.short_conv_prefill;
+
+    command_buffer.push_gpu_command(move |stream| unsafe {
+        let mut p_pad = padded.as_ptr() as *const c_void;
+        let mut p_in = in_proj.as_ptr() as *const c_void;
+        let mut p_w = w.as_ptr() as *const c_void;
+        let mut p_b = b_ptr.as_ptr() as *const c_void;
+        let mut p_out = out.as_ptr() as *mut c_void;
+        let mut p_sout = state_out.as_ptr() as *mut c_void;
+        let mut p_sl = suffix_len;
+        let mut p_ks = kernel_size;
+        let mut p_ips = in_proj_stride;
+        let mut p_ss = state_stride;
+        let mut p_md = model_dim;
+        let mut p_dt = dtype;
+        let mut p_hb = has_bias;
+        let mut params: [*mut c_void; 13] = [
+            (&mut p_pad as *mut *const c_void).cast(),
+            (&mut p_in as *mut *const c_void).cast(),
+            (&mut p_w as *mut *const c_void).cast(),
+            (&mut p_b as *mut *const c_void).cast(),
+            (&mut p_out as *mut *mut c_void).cast(),
+            (&mut p_sout as *mut *mut c_void).cast(),
+            (&mut p_sl as *mut u32).cast(),
+            (&mut p_ks as *mut u32).cast(),
+            (&mut p_ips as *mut u32).cast(),
+            (&mut p_ss as *mut u32).cast(),
+            (&mut p_md as *mut u32).cast(),
+            (&mut p_dt as *mut u32).cast(),
+            (&mut p_hb as *mut u32).cast(),
+        ];
+        let tap_count = kernel_size.saturating_sub(1);
+        let total = (suffix_len.saturating_add(tap_count)).saturating_mul(model_dim);
+        let block = 128u32;
+        let grid = total.div_ceil(block);
+        stream
+            .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+            .expect("rocm_short_conv_prefill failed");
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_short_conv_decode(
+    kernel: &ShortConvDecodeRocmKernel,
+    in_proj: SendPtr<u8>,
+    w: SendPtr<u8>,
+    b: Option<SendPtr<u8>>,
+    state: Option<SendPtr<u8>>,
+    out: SendPtrMut<u8>,
+    next_state: SendPtrMut<u8>,
+    suffix_len: u32,
+    kernel_size: u32,
+    in_proj_stride: u32,
+    state_stride: u32,
+    model_dim: u32,
+    command_buffer: &mut RocmCommandBufferEncoding,
+) -> bool {
+    if kernel.WeightT != DataType::F32 {
+        return false;
+    }
+    let Some(dtype) = dtype_code(kernel.T) else {
+        return false;
+    };
+    let b_ptr = b.unwrap_or(SendPtr(std::ptr::null()));
+    let state_ptr = state.unwrap_or(SendPtr(std::ptr::null()));
+    let flags = u32::from(kernel.has_bias) | (u32::from(kernel.state_in_place) << 1);
+    let func = command_buffer.context().kernels.short_conv_decode;
+
+    command_buffer.push_gpu_command(move |stream| unsafe {
+        let mut p_in = in_proj.as_ptr() as *const c_void;
+        let mut p_w = w.as_ptr() as *const c_void;
+        let mut p_b = b_ptr.as_ptr() as *const c_void;
+        let mut p_st = state_ptr.as_ptr() as *const c_void;
+        let mut p_out = out.as_ptr() as *mut c_void;
+        let mut p_nst = next_state.as_ptr() as *mut c_void;
+        let mut p_sl = suffix_len;
+        let mut p_ks = kernel_size;
+        let mut p_ips = in_proj_stride;
+        let mut p_ss = state_stride;
+        let mut p_md = model_dim;
+        let mut p_dt = dtype;
+        let mut p_fl = flags;
+        let mut params: [*mut c_void; 13] = [
+            (&mut p_in as *mut *const c_void).cast(),
+            (&mut p_w as *mut *const c_void).cast(),
+            (&mut p_b as *mut *const c_void).cast(),
+            (&mut p_st as *mut *const c_void).cast(),
+            (&mut p_out as *mut *mut c_void).cast(),
+            (&mut p_nst as *mut *mut c_void).cast(),
+            (&mut p_sl as *mut u32).cast(),
+            (&mut p_ks as *mut u32).cast(),
+            (&mut p_ips as *mut u32).cast(),
+            (&mut p_ss as *mut u32).cast(),
+            (&mut p_md as *mut u32).cast(),
+            (&mut p_dt as *mut u32).cast(),
+            (&mut p_fl as *mut u32).cast(),
+        ];
+        let block = 128u32;
+        let grid = model_dim.div_ceil(block);
+        stream
+            .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+            .expect("rocm_short_conv_decode failed");
+    });
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_encode_attention_prepare(
+    kernel: &AttentionPrepareRocmKernel,
+    qkvg: SendPtr<u8>,
+    queries: SendPtrMut<u8>,
+    keys: Option<SendPtrMut<u8>>,
+    values: Option<SendPtrMut<u8>>,
+    cosines: Option<SendPtr<u8>>,
+    sines: Option<SendPtr<u8>>,
+    num_q_heads: u32,
+    num_kv_heads: Option<u32>,
+    head_dim: u32,
+    rope_dim: Option<u32>,
+    kv_token_offset: Option<u32>,
+    input_row_stride: u32,
+    batch_dim: u32,
+    command_buffer: &mut RocmCommandBufferEncoding,
+) -> bool {
+    if kernel.RopeT != DataType::F32 {
+        return false;
+    }
+    let Some(dtype) = dtype_code(kernel.ElementT) else {
+        return false;
+    };
+    let keys_ptr = keys.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+    let values_ptr = values.unwrap_or(SendPtrMut(std::ptr::null_mut()));
+    let cos_ptr = cosines.unwrap_or(SendPtr(std::ptr::null()));
+    let sin_ptr = sines.unwrap_or(SendPtr(std::ptr::null()));
+    let n_kvh = num_kv_heads.unwrap_or(0);
+    let r_dim = rope_dim.unwrap_or(0);
+    let kv_off = kv_token_offset.unwrap_or(0);
+    let flags = u32::from(kernel.has_kv) | (u32::from(kernel.has_rope) << 1);
+    let total_heads = if kernel.has_kv {
+        num_q_heads + n_kvh * 2
+    } else {
+        num_q_heads
+    };
+    let func = command_buffer.context().kernels.attention_prepare;
+
+    command_buffer.push_gpu_command(move |stream| unsafe {
+        let mut p_qkvg = qkvg.as_ptr() as *const c_void;
+        let mut p_q = queries.as_ptr() as *mut c_void;
+        let mut p_k = keys_ptr.as_ptr() as *mut c_void;
+        let mut p_v = values_ptr.as_ptr() as *mut c_void;
+        let mut p_cos = cos_ptr.as_ptr() as *const c_void;
+        let mut p_sin = sin_ptr.as_ptr() as *const c_void;
+        let mut p_nqh = num_q_heads;
+        let mut p_nkvh = n_kvh;
+        let mut p_hd = head_dim;
+        let mut p_rd = r_dim;
+        let mut p_kvoff = kv_off;
+        let mut p_irs = input_row_stride;
+        let mut p_bd = batch_dim;
+        let mut p_dt = dtype;
+        let mut p_fl = flags;
+        let mut params: [*mut c_void; 15] = [
+            (&mut p_qkvg as *mut *const c_void).cast(),
+            (&mut p_q as *mut *mut c_void).cast(),
+            (&mut p_k as *mut *mut c_void).cast(),
+            (&mut p_v as *mut *mut c_void).cast(),
+            (&mut p_cos as *mut *const c_void).cast(),
+            (&mut p_sin as *mut *const c_void).cast(),
+            (&mut p_nqh as *mut u32).cast(),
+            (&mut p_nkvh as *mut u32).cast(),
+            (&mut p_hd as *mut u32).cast(),
+            (&mut p_rd as *mut u32).cast(),
+            (&mut p_kvoff as *mut u32).cast(),
+            (&mut p_irs as *mut u32).cast(),
+            (&mut p_bd as *mut u32).cast(),
+            (&mut p_dt as *mut u32).cast(),
+            (&mut p_fl as *mut u32).cast(),
+        ];
+        let total = batch_dim.saturating_mul(total_heads).saturating_mul(head_dim);
+        let block = 128u32;
+        let grid = total.div_ceil(block);
+        stream
+            .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+            .expect("rocm_attention_prepare failed");
     });
     true
 }
@@ -730,9 +1182,9 @@ pub(crate) fn try_encode_input_embedding_lookup(
     kernel: &InputEmbeddingLookupRocmKernel,
     token_ids: SendPtr<u8>,
     values: SendPtr<u8>,
-    _scales: Option<SendPtr<u8>>,
-    _zero_points: Option<SendPtr<u8>>,
-    _biases: Option<SendPtr<u8>>,
+    scales: Option<SendPtr<u8>>,
+    zero_points: Option<SendPtr<u8>>,
+    biases: Option<SendPtr<u8>>,
     hadamard_factors: Option<SendPtr<u8>>,
     _ladder_indices: Option<SendPtr<u8>>,
     _ladder: Option<SendPtr<u8>>,
@@ -744,14 +1196,84 @@ pub(crate) fn try_encode_input_embedding_lookup(
     input_scale: f32,
     command_buffer: &mut RocmCommandBufferEncoding,
 ) -> bool {
-    if kernel.table_kind != EmbeddingTableKind::Dense {
-        return false;
-    }
     let Some(dtype) = dtype_code(kernel.T) else {
         return false;
     };
     let use_hadamard = kernel.use_hadamard;
     let had_ptr = hadamard_factors.unwrap_or(SendPtr(std::ptr::null()));
+
+    if kernel.table_kind == EmbeddingTableKind::Quantized {
+        let (Some(group_size), Some(mode), Some(method), Some(scales_ptr)) =
+            (kernel.group_size, kernel.quantization_mode, kernel.quantization_method, scales)
+        else {
+            return false;
+        };
+        let quant_mode = match mode {
+            QuantizationMode::U4 => 0u32,
+            QuantizationMode::I8 => 1u32,
+            QuantizationMode::U8 => 2u32,
+        };
+        let quant_method = match method {
+            QuantizationMethod::ScaleBias => 0u32,
+            QuantizationMethod::ScaleZeroPoint => 1u32,
+            QuantizationMethod::ScaleSymmetric => 2u32,
+        };
+        let zp_ptr = zero_points.unwrap_or(SendPtr(std::ptr::null()));
+        let bias_ptr = biases.unwrap_or(SendPtr(std::ptr::null()));
+        let func = command_buffer.context().kernels.input_embedding_lookup_quant;
+
+        command_buffer.push_gpu_command(move |stream| unsafe {
+            let mut p_toks = token_ids.as_ptr() as *const c_void;
+            let mut p_vals = values.as_ptr() as *const c_void;
+            let mut p_sc = scales_ptr.as_ptr() as *const c_void;
+            let mut p_zp = zp_ptr.as_ptr() as *const c_void;
+            let mut p_bi = bias_ptr.as_ptr() as *const c_void;
+            let mut p_had = had_ptr.as_ptr() as *const c_void;
+            let mut p_out = output.as_ptr() as *mut c_void;
+            let mut p_bs = batch_size;
+            let mut p_vs = vocab_size;
+            let mut p_md = model_dim;
+            let mut p_gs = group_size;
+            let mut p_qm = quant_mode;
+            let mut p_qmeth = quant_method;
+            let mut p_scale = input_scale;
+            let mut p_dtype = dtype;
+            let mut p_uhad = u32::from(use_hadamard);
+            let mut params: [*mut c_void; 16] = [
+                (&mut p_toks as *mut *const c_void).cast(),
+                (&mut p_vals as *mut *const c_void).cast(),
+                (&mut p_sc as *mut *const c_void).cast(),
+                (&mut p_zp as *mut *const c_void).cast(),
+                (&mut p_bi as *mut *const c_void).cast(),
+                (&mut p_had as *mut *const c_void).cast(),
+                (&mut p_out as *mut *mut c_void).cast(),
+                (&mut p_bs as *mut u32).cast(),
+                (&mut p_vs as *mut u32).cast(),
+                (&mut p_md as *mut u32).cast(),
+                (&mut p_gs as *mut u32).cast(),
+                (&mut p_qm as *mut u32).cast(),
+                (&mut p_qmeth as *mut u32).cast(),
+                (&mut p_scale as *mut f32).cast(),
+                (&mut p_dtype as *mut u32).cast(),
+                (&mut p_uhad as *mut u32).cast(),
+            ];
+            let total = if use_hadamard {
+                batch_size.saturating_mul(model_dim / 32)
+            } else {
+                batch_size.saturating_mul(model_dim)
+            };
+            let block = 128u32;
+            let grid = total.div_ceil(block);
+            stream
+                .launch_kernel(func, (grid, 1, 1), (block, 1, 1), 0, &mut params)
+                .expect("rocm_input_embedding_lookup_quant failed");
+        });
+        return true;
+    }
+
+    if kernel.table_kind != EmbeddingTableKind::Dense {
+        return false;
+    }
     let func = command_buffer.context().kernels.input_embedding_lookup_dense;
 
     command_buffer.push_gpu_command(move |stream| unsafe {

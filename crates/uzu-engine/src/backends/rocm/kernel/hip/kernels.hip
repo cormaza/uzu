@@ -176,70 +176,136 @@ extern "C" __global__ void rocm_matmul_quant(
     float soft_cap,
     uint32_t has_soft_cap
 ) {
-    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t tid = threadIdx.x;
+    uint32_t lane = tid & 7u;
+    uint32_t idx = (blockIdx.x * blockDim.x + tid) >> 3u;
     uint32_t total = m * n;
-    if (idx >= total) return;
+    bool valid = (idx < total);
 
-    size_t row = idx / n;
-    size_t col = idx % n;
+    __shared__ float s_acc[128];
+    float accumulator = 0.0f;
+
+    size_t row = valid ? (idx / n) : 0;
+    size_t col = valid ? (idx % n) : 0;
     size_t k_u = k;
-    size_t b_col = (gather != nullptr) ? size_t(gather[row * size_t(n) + col]) : col;
+    size_t b_col = (valid && gather != nullptr) ? size_t(gather[row * size_t(n) + col]) : col;
     size_t pack_factor = 32 / b_bits;
     uint32_t code_mask = (1u << b_bits) - 1u;
     float midpoint = float(1u << (b_bits - 1u));
 
-    float accumulator = 0.0f;
-    for (size_t inner = 0; inner < k_u; ++inner) {
-        float a_val = read_a_val(a, a_scales, input_dtype, a_mode, a_group_size, a_code_layout, row, k_u, inner);
-
-        size_t weight_linear_index = b_col * k_u + inner;
-        size_t word_index = weight_linear_index / pack_factor;
-        size_t code_index_in_word = weight_linear_index % pack_factor;
-        uint32_t bit_offset = uint32_t(code_index_in_word) * b_bits;
-        uint32_t word = b_weights[word_index];
-        uint8_t weight_code = uint8_t((word >> bit_offset) & code_mask);
-        if (b_signed_codes != 0) {
-            weight_code ^= uint8_t(1u << (b_bits - 1u));
-        }
-        float quantized_value = float(weight_code);
-
-        size_t group_index = inner / b_group_size;
-        size_t metadata_index = b_col * size_t(scale_out_stride) + group_index * size_t(scale_grp_stride);
-        float scale = read_elem(b_scales, weights_dtype, metadata_index);
-
-        float bias_term;
-        if (b_zp != nullptr) {
-            size_t zp_index = b_col * size_t(zp_out_stride) + group_index * size_t(zp_grp_stride);
-            float zp_val;
-            if (b_bits == 4) {
-                uint8_t byte_val = b_zp[zp_index / 2];
-                if ((zp_index & 1) == 0) {
-                    zp_val = float(byte_val & 0x0Fu);
+    if (valid) {
+        if (b_group_size > 0 && (k_u % b_group_size) == 0 && (b_group_size % pack_factor) == 0) {
+            size_t num_b_groups = k_u / b_group_size;
+            size_t words_per_group = b_group_size / pack_factor;
+            size_t a_groups = (a_mode != 0 && a_group_size > 0) ? ((k_u + a_group_size - 1) / a_group_size) : 0;
+            const int8_t* a_row_i8 = reinterpret_cast<const int8_t*>(a) + row * k_u;
+            for (size_t group_index = 0; group_index < num_b_groups; ++group_index) {
+                size_t metadata_index = b_col * size_t(scale_out_stride) + group_index * size_t(scale_grp_stride);
+                float scale = read_elem(b_scales, weights_dtype, metadata_index);
+                float bias_term;
+                if (b_zp != nullptr) {
+                    size_t zp_index = b_col * size_t(zp_out_stride) + group_index * size_t(zp_grp_stride);
+                    float zp_val;
+                    if (b_bits == 4) {
+                        uint8_t byte_val = b_zp[zp_index / 2];
+                        zp_val = ((zp_index & 1) == 0) ? float(byte_val & 0x0Fu) : float((byte_val >> 4) & 0x0Fu);
+                    } else {
+                        zp_val = float(b_zp[zp_index]);
+                    }
+                    bias_term = -scale * zp_val;
+                } else if (b_biases != nullptr) {
+                    bias_term = read_elem(b_biases, weights_dtype, metadata_index);
                 } else {
-                    zp_val = float((byte_val >> 4) & 0x0Fu);
+                    bias_term = -scale * midpoint;
                 }
-            } else {
-                zp_val = float(b_zp[zp_index]);
+
+                size_t group_start = group_index * b_group_size;
+                for (size_t w = lane; w < words_per_group; w += 8u) {
+                    size_t inner_base = group_start + w * pack_factor;
+                    uint32_t word = b_weights[(b_col * k_u + inner_base) / pack_factor];
+                    for (size_t c = 0; c < pack_factor; ++c) {
+                        size_t inner = inner_base + c;
+                        float a_val;
+                        if (a_mode == 0) {
+                            a_val = read_elem(a, input_dtype, row * k_u + inner);
+                        } else {
+                            size_t a_grp = inner / a_group_size;
+                            size_t code_idx = int8_code_index(inner, a_code_layout);
+                            a_val = float(a_row_i8[code_idx]) * a_scales[row * a_groups + a_grp];
+                        }
+                        uint8_t weight_code = uint8_t((word >> (uint32_t(c) * b_bits)) & code_mask);
+                        if (b_signed_codes != 0) {
+                            weight_code ^= uint8_t(1u << (b_bits - 1u));
+                        }
+                        float b_val = scale * float(weight_code) + bias_term;
+                        accumulator += a_val * b_val;
+                    }
+                }
             }
-            bias_term = -scale * zp_val;
-        } else if (b_biases != nullptr) {
-            bias_term = read_elem(b_biases, weights_dtype, metadata_index);
-        } else {
-            bias_term = -scale * midpoint;
+        } else if (lane == 0) {
+            for (size_t inner = 0; inner < k_u; ++inner) {
+                float a_val = read_a_val(a, a_scales, input_dtype, a_mode, a_group_size, a_code_layout, row, k_u, inner);
+
+                size_t weight_linear_index = b_col * k_u + inner;
+                size_t word_index = weight_linear_index / pack_factor;
+                size_t code_index_in_word = weight_linear_index % pack_factor;
+                uint32_t bit_offset = uint32_t(code_index_in_word) * b_bits;
+                uint32_t word = b_weights[word_index];
+                uint8_t weight_code = uint8_t((word >> bit_offset) & code_mask);
+                if (b_signed_codes != 0) {
+                    weight_code ^= uint8_t(1u << (b_bits - 1u));
+                }
+                float quantized_value = float(weight_code);
+
+                size_t group_index = inner / b_group_size;
+                size_t metadata_index = b_col * size_t(scale_out_stride) + group_index * size_t(scale_grp_stride);
+                float scale = read_elem(b_scales, weights_dtype, metadata_index);
+
+                float bias_term;
+                if (b_zp != nullptr) {
+                    size_t zp_index = b_col * size_t(zp_out_stride) + group_index * size_t(zp_grp_stride);
+                    float zp_val;
+                    if (b_bits == 4) {
+                        uint8_t byte_val = b_zp[zp_index / 2];
+                        if ((zp_index & 1) == 0) {
+                            zp_val = float(byte_val & 0x0Fu);
+                        } else {
+                            zp_val = float((byte_val >> 4) & 0x0Fu);
+                        }
+                    } else {
+                        zp_val = float(b_zp[zp_index]);
+                    }
+                    bias_term = -scale * zp_val;
+                } else if (b_biases != nullptr) {
+                    bias_term = read_elem(b_biases, weights_dtype, metadata_index);
+                } else {
+                    bias_term = -scale * midpoint;
+                }
+
+                float b_val = scale * quantized_value + bias_term;
+                accumulator += a_val * b_val;
+            }
         }
-
-        float b_val = scale * quantized_value + bias_term;
-        accumulator += a_val * b_val;
     }
 
-    float value = output_scale * accumulator;
-    if (output_bias != nullptr) {
-        value += read_elem(output_bias, weights_dtype, col);
+    s_acc[tid] = accumulator;
+    __syncthreads();
+    if (lane < 4u) s_acc[tid] += s_acc[tid + 4u];
+    __syncthreads();
+    if (lane < 2u) s_acc[tid] += s_acc[tid + 2u];
+    __syncthreads();
+
+    if (valid && lane == 0u) {
+        float sum = s_acc[tid] + s_acc[tid + 1u];
+        float value = output_scale * sum;
+        if (output_bias != nullptr) {
+            value += read_elem(output_bias, weights_dtype, col);
+        }
+        if (has_soft_cap != 0) {
+            value = soft_cap * tanhf(value / soft_cap);
+        }
+        write_elem(d, output_dtype, row * size_t(n) + col, value);
     }
-    if (has_soft_cap != 0) {
-        value = soft_cap * tanhf(value / soft_cap);
-    }
-    write_elem(d, output_dtype, row * size_t(n) + col, value);
 }
 
 __device__ __forceinline__ uint16_t trellis_decode_state(
@@ -991,5 +1057,525 @@ extern "C" __global__ void rocm_input_embedding_lookup_dense(
                 write_elem(output, dtype, size_t(batch) * model_dim + col, block[lane] * float(hadamard_factors[col]));
             }
         }
+    }
+}
+
+__device__ __forceinline__ uint8_t rocm_read_u4(const uint8_t* values, size_t nibble) {
+    return (values[nibble / 2u] >> (4u * (nibble & 1u))) & 0x0Fu;
+}
+
+__device__ __forceinline__ float rocm_load_quant_emb(
+    const uint8_t* values,
+    const uint8_t* scales,
+    const uint8_t* zero_points,
+    const uint8_t* biases,
+    size_t token,
+    uint32_t column,
+    uint32_t dim,
+    uint32_t group_size,
+    uint32_t quant_mode, // 0=U4, 1=I8, 2=U8
+    uint32_t quant_method, // 0=ScaleBias, 1=ScaleZeroPoint, 2=ScaleSymmetric
+    float input_scale,
+    uint32_t dtype
+) {
+    uint32_t num_groups = (dim + group_size - 1u) / group_size;
+    uint32_t pack_div = (quant_mode == 0u) ? 2u : 1u;
+    size_t weights_stride = dim / pack_div;
+    uint32_t group = column / group_size;
+    size_t index = token * num_groups + group;
+    float scale = read_elem(scales, dtype, index);
+    size_t offset = token * weights_stride;
+    float code;
+    if (quant_mode == 0u) {
+        code = float(rocm_read_u4(values, 2u * offset + column));
+    } else if (quant_mode == 1u) {
+        code = float(reinterpret_cast<const int8_t*>(values)[offset + column]);
+    } else {
+        code = float(values[offset + column]);
+    }
+    float bias;
+    if (quant_method == 0u) {
+        bias = read_elem(biases, dtype, index);
+    } else if (quant_method == 1u) {
+        uint8_t zp;
+        if (quant_mode == 0u) {
+            size_t zp_groups_padded = (num_groups + 1u) / 2u;
+            zp = rocm_read_u4(zero_points, 2u * token * zp_groups_padded + group);
+        } else {
+            zp = zero_points[index];
+        }
+        bias = -scale * float(zp);
+    } else {
+        float midpoint = (quant_mode == 0u) ? 8.0f : 128.0f;
+        bias = -scale * midpoint;
+    }
+    return round_to_dtype((scale * code + bias) * input_scale, dtype);
+}
+
+extern "C" __global__ void rocm_input_embedding_lookup_quant(
+    const uint32_t* token_ids,
+    const uint8_t* values,
+    const uint8_t* scales,
+    const uint8_t* zero_points,
+    const uint8_t* biases,
+    const int32_t* hadamard_factors,
+    uint8_t* output,
+    uint32_t batch_size,
+    uint32_t vocab_size,
+    uint32_t model_dim,
+    uint32_t group_size,
+    uint32_t quant_mode,
+    uint32_t quant_method,
+    float input_scale,
+    uint32_t dtype,
+    uint32_t use_hadamard
+) {
+    if (use_hadamard == 0) {
+        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t total = batch_size * model_dim;
+        if (idx >= total) return;
+        uint32_t batch = idx / model_dim;
+        uint32_t col = idx % model_dim;
+        uint32_t token = token_ids[batch];
+        if (token >= vocab_size) {
+            write_elem(output, dtype, idx, 0.0f);
+        } else {
+            float v = rocm_load_quant_emb(
+                values, scales, zero_points, biases, token, col, model_dim,
+                group_size, quant_mode, quant_method, input_scale, dtype
+            );
+            write_elem(output, dtype, idx, v);
+        }
+    } else {
+        uint32_t stripe_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t stripes_per_row = model_dim / 32u;
+        uint32_t total_stripes = batch_size * stripes_per_row;
+        if (stripe_idx >= total_stripes) return;
+        uint32_t batch = stripe_idx / stripes_per_row;
+        uint32_t block_start = (stripe_idx % stripes_per_row) * 32u;
+        uint32_t token = token_ids[batch];
+        if (token >= vocab_size) {
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                write_elem(output, dtype, size_t(batch) * model_dim + block_start + lane, 0.0f);
+            }
+        } else {
+            float block[32];
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                uint32_t col = block_start + lane;
+                block[lane] = rocm_load_quant_emb(
+                    values, scales, zero_points, biases, token, col, model_dim,
+                    group_size, quant_mode, quant_method, input_scale, dtype
+                );
+            }
+            hadamard_block_32(block);
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                uint32_t col = block_start + lane;
+                write_elem(output, dtype, size_t(batch) * model_dim + col, block[lane] * float(hadamard_factors[col]));
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ float min_max_symmetric_divisor_device(const float* values, uint32_t len) {
+    float min_v = INFINITY;
+    float max_v = -INFINITY;
+    for (uint32_t i = 0; i < len; ++i) {
+        float v = values[i];
+        min_v = fminf(min_v, v);
+        max_v = fmaxf(max_v, v);
+    }
+    float magnitude = fmaxf(fabsf(min_v), fabsf(max_v));
+    if (isfinite(magnitude) && magnitude > 0.0f) {
+        return magnitude / 127.0f;
+    }
+    return 1.0f;
+}
+
+__device__ __forceinline__ int8_t quantize_symmetric_i8_device(float value, float divisor) {
+    float q = roundf(value / divisor);
+    if (isnan(q)) return 0;
+    q = fminf(fmaxf(q, -127.0f), 127.0f);
+    return int8_t(int32_t(q));
+}
+
+extern "C" __global__ void rocm_activation_transform(
+    const uint8_t* input,
+    uint8_t* fp_out,
+    const uint8_t* bias,
+    int8_t* q_out,
+    float* scales_out,
+    int32_t* group_sums_out,
+    const int32_t* rht_factors,
+    uint32_t batch_size,
+    uint32_t element_count,
+    uint32_t scale_group_size,
+    uint32_t sum_group_size,
+    uint32_t t_dtype,
+    uint32_t bias_dtype,
+    uint32_t flags
+) {
+    bool input_rht = (flags & 1u) != 0;
+    bool quantize = (flags & 2u) != 0;
+    bool emit_group_sums = (flags & 4u) != 0;
+    uint32_t code_layout = ((flags & 8u) != 0) ? 1u : 0u;
+    bool has_bias = (flags & 16u) != 0;
+
+    if (!quantize) {
+        uint32_t stripe_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t stripes_per_row = element_count / 32u;
+        uint32_t total_stripes = batch_size * stripes_per_row;
+        if (stripe_idx >= total_stripes) return;
+
+        uint32_t row = stripe_idx / stripes_per_row;
+        uint32_t stripe_start = (stripe_idx % stripes_per_row) * 32u;
+        size_t row_offset = size_t(row) * element_count;
+
+        float stripe[32];
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            uint32_t index = stripe_start + lane;
+            float value = read_elem(input, t_dtype, row_offset + index);
+            float factor = float(rht_factors[index]);
+            stripe[lane] = input_rht ? (value * factor) : value;
+        }
+        hadamard_block_32(stripe);
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            uint32_t index = stripe_start + lane;
+            float factor = float(rht_factors[index]);
+            float value = input_rht ? stripe[lane] : (stripe[lane] * factor);
+            if (has_bias) {
+                value = round_to_dtype(value, t_dtype) + read_elem(bias, bias_dtype, index);
+            }
+            write_elem(fp_out, t_dtype, row_offset + index, value);
+        }
+    } else {
+        uint32_t grp_idx = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t groups_per_row = element_count / scale_group_size;
+        uint32_t total_groups = batch_size * groups_per_row;
+        if (grp_idx >= total_groups || scale_group_size > 256u) return;
+
+        uint32_t row = grp_idx / groups_per_row;
+        uint32_t scale_group_index = grp_idx % groups_per_row;
+        size_t row_offset = size_t(row) * element_count;
+        uint32_t group_col_start = scale_group_index * scale_group_size;
+
+        float transformed[256];
+        for (uint32_t sub = 0; sub < scale_group_size; sub += 32u) {
+            float stripe[32];
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                uint32_t index = group_col_start + sub + lane;
+                float value = read_elem(input, t_dtype, row_offset + index);
+                float factor = float(rht_factors[index]);
+                stripe[lane] = input_rht ? (value * factor) : value;
+            }
+            hadamard_block_32(stripe);
+            for (uint32_t lane = 0; lane < 32; ++lane) {
+                uint32_t index = group_col_start + sub + lane;
+                float factor = float(rht_factors[index]);
+                transformed[sub + lane] = input_rht ? stripe[lane] : (stripe[lane] * factor);
+            }
+        }
+
+        float scale = min_max_symmetric_divisor_device(transformed, scale_group_size);
+        scales_out[size_t(row) * groups_per_row + scale_group_index] = scale;
+
+        uint32_t sums_per_row = emit_group_sums ? (element_count / sum_group_size) : 0u;
+        uint32_t sum_grp_start = emit_group_sums ? (group_col_start / sum_group_size) : 0u;
+        uint32_t sum_grp_count = emit_group_sums ? (scale_group_size / sum_group_size) : 0u;
+        for (uint32_t s = 0; s < sum_grp_count; ++s) {
+            group_sums_out[size_t(row) * sums_per_row + sum_grp_start + s] = 0;
+        }
+
+        int8_t* q_row = q_out + row_offset;
+        for (uint32_t i = 0; i < scale_group_size; ++i) {
+            int8_t code = quantize_symmetric_i8_device(transformed[i], scale);
+            size_t abs_idx = group_col_start + i;
+            size_t out_idx = int8_code_index(abs_idx, code_layout);
+            q_row[out_idx] = code;
+            if (emit_group_sums) {
+                group_sums_out[size_t(row) * sums_per_row + (abs_idx / sum_group_size)] += int32_t(code);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void rocm_gated_act_mul_quant(
+    const uint8_t* act_operand,
+    const uint8_t* value_operand,
+    int8_t* q_out,
+    float* scales_out,
+    int32_t* group_sums_out,
+    const int32_t* hadamard_factors,
+    uint32_t gated_dim,
+    uint32_t batch_dim,
+    uint32_t value_offset,
+    uint32_t value_row_stride,
+    uint32_t scale_group_size,
+    uint32_t sum_group_size,
+    uint32_t act_type,
+    float activation_alpha,
+    float gate_clip_min,
+    float gate_clip_max,
+    float value_clip_min,
+    float value_clip_max,
+    uint32_t dtype,
+    uint32_t flags
+) {
+    bool interleaved = (flags & 1u) != 0;
+    bool custom_alpha = (flags & 4u) != 0;
+    bool clip_gate = (flags & 8u) != 0;
+    bool clip_value = (flags & 16u) != 0;
+    bool emit_group_sums = (flags & 32u) != 0;
+    uint32_t code_layout = ((flags & 64u) != 0) ? 1u : 0u;
+
+    uint32_t grp_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t groups_per_row = gated_dim / scale_group_size;
+    uint32_t total_groups = batch_dim * groups_per_row;
+    if (grp_idx >= total_groups || scale_group_size > 256u) return;
+
+    uint32_t batch = grp_idx / groups_per_row;
+    uint32_t scale_group_index = grp_idx % groups_per_row;
+    uint32_t group_col_start = scale_group_index * scale_group_size;
+
+    float transformed[256];
+    for (uint32_t sub = 0; sub < scale_group_size; sub += 32u) {
+        float stripe[32];
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            uint32_t gated = group_col_start + sub + lane;
+            size_t act_idx;
+            float val;
+            if (interleaved) {
+                size_t base = size_t(batch) * 2u * gated_dim;
+                act_idx = base + gated_dim + gated;
+                val = read_elem(act_operand, dtype, base + gated);
+            } else {
+                size_t value_idx = size_t(batch) * value_row_stride + value_offset + gated;
+                act_idx = size_t(batch) * gated_dim + gated;
+                val = read_elem(value_operand, dtype, value_idx);
+            }
+            float gate = read_elem(act_operand, dtype, act_idx);
+            if (clip_gate) {
+                gate = fminf(fmaxf(gate, gate_clip_min), gate_clip_max);
+                gate = round_to_dtype(gate, dtype);
+            }
+            float alpha = (custom_alpha && act_type == 0) ? activation_alpha : 1.0f;
+            float activated = round_to_dtype(apply_activation(gate, act_type, alpha), dtype);
+            if (clip_value) {
+                val = fminf(fmaxf(val, value_clip_min), value_clip_max);
+                val = round_to_dtype(val, dtype);
+            }
+            float res = round_to_dtype(val * activated, dtype);
+            stripe[lane] = res * float(hadamard_factors[gated]);
+        }
+        hadamard_block_32(stripe);
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            transformed[sub + lane] = stripe[lane];
+        }
+    }
+
+    float scale = min_max_symmetric_divisor_device(transformed, scale_group_size);
+    scales_out[size_t(batch) * groups_per_row + scale_group_index] = scale;
+
+    uint32_t sums_per_row = emit_group_sums ? (gated_dim / sum_group_size) : 0u;
+    uint32_t sum_grp_start = emit_group_sums ? (group_col_start / sum_group_size) : 0u;
+    uint32_t sum_grp_count = emit_group_sums ? (scale_group_size / sum_group_size) : 0u;
+    for (uint32_t s = 0; s < sum_grp_count; ++s) {
+        group_sums_out[size_t(batch) * sums_per_row + sum_grp_start + s] = 0;
+    }
+
+    int8_t* q_row = q_out + size_t(batch) * gated_dim;
+    for (uint32_t i = 0; i < scale_group_size; ++i) {
+        int8_t code = quantize_symmetric_i8_device(transformed[i], scale);
+        size_t abs_idx = group_col_start + i;
+        size_t out_idx = int8_code_index(abs_idx, code_layout);
+        q_row[out_idx] = code;
+        if (emit_group_sums) {
+            group_sums_out[size_t(batch) * sums_per_row + (abs_idx / sum_group_size)] += int32_t(code);
+        }
+    }
+}
+
+extern "C" __global__ void rocm_short_conv_pack(
+    const uint8_t* state_in,
+    const uint8_t* in_proj,
+    uint8_t* padded,
+    uint32_t state_stride,
+    uint32_t suffix_len,
+    uint32_t in_proj_stride,
+    uint32_t model_dim,
+    uint32_t dtype
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t total_rows = state_stride + suffix_len;
+    uint32_t total = total_rows * model_dim;
+    if (idx >= total) return;
+
+    uint32_t row_idx = idx / model_dim;
+    uint32_t channel_idx = idx % model_dim;
+    size_t padded_offset = size_t(row_idx) * model_dim + channel_idx;
+
+    if (row_idx < state_stride) {
+        size_t state_idx = size_t(channel_idx) * state_stride + row_idx;
+        float val = read_elem(state_in, dtype, state_idx);
+        write_elem(padded, dtype, padded_offset, val);
+    } else {
+        uint32_t token = row_idx - state_stride;
+        size_t in_proj_idx = size_t(token) * in_proj_stride + channel_idx;
+        float pre_gate = read_elem(in_proj, dtype, in_proj_idx);
+        float x_in = read_elem(in_proj, dtype, in_proj_idx + 2u * model_dim);
+        write_elem(padded, dtype, padded_offset, x_in * pre_gate);
+    }
+}
+
+extern "C" __global__ void rocm_short_conv_prefill(
+    const uint8_t* padded,
+    const uint8_t* in_proj,
+    const float* w,
+    const float* b,
+    uint8_t* out,
+    uint8_t* state_out,
+    uint32_t suffix_len,
+    uint32_t kernel_size,
+    uint32_t in_proj_stride,
+    uint32_t state_stride,
+    uint32_t model_dim,
+    uint32_t dtype,
+    uint32_t has_bias
+) {
+    uint32_t tap_count = (kernel_size > 0u) ? (kernel_size - 1u) : 0u;
+    uint32_t total_rows = suffix_len + tap_count;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t total = total_rows * model_dim;
+    if (idx >= total) return;
+
+    uint32_t token_idx = idx / model_dim;
+    uint32_t channel_idx = idx % model_dim;
+    const float* w_row = w + size_t(channel_idx) * kernel_size;
+
+    if (token_idx < suffix_len) {
+        float acc = (has_bias != 0) ? b[channel_idx] : 0.0f;
+        for (uint32_t tap = 0; tap < kernel_size; ++tap) {
+            size_t padded_offset = size_t(token_idx + tap) * model_dim + channel_idx;
+            float sample = read_elem(padded, dtype, padded_offset);
+            acc += w_row[tap] * sample;
+        }
+        size_t in_proj_idx = size_t(token_idx) * in_proj_stride + channel_idx;
+        float post_conv_gate = read_elem(in_proj, dtype, in_proj_idx + model_dim);
+        write_elem(out, dtype, size_t(token_idx) * model_dim + channel_idx, acc * post_conv_gate);
+    } else if (tap_count > 0u) {
+        uint32_t tap = token_idx - suffix_len;
+        if (tap < tap_count) {
+            size_t padded_offset = size_t(suffix_len + tap) * model_dim + channel_idx;
+            size_t state_idx = size_t(channel_idx) * state_stride + tap;
+            write_elem(state_out, dtype, state_idx, read_elem(padded, dtype, padded_offset));
+        }
+    }
+}
+
+extern "C" __global__ void rocm_short_conv_decode(
+    const uint8_t* in_proj,
+    const float* w,
+    const float* b,
+    const uint8_t* state_in,
+    uint8_t* out,
+    uint8_t* next_state,
+    uint32_t suffix_len,
+    uint32_t kernel_size,
+    uint32_t in_proj_stride,
+    uint32_t state_stride,
+    uint32_t model_dim,
+    uint32_t dtype,
+    uint32_t flags
+) {
+    uint32_t channel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel_idx >= model_dim) return;
+
+    bool has_bias = (flags & 1u) != 0;
+    bool state_in_place = (flags & 2u) != 0;
+    uint32_t tap_count = (kernel_size > 0u) ? (kernel_size - 1u) : 0u;
+    size_t state_offset = size_t(channel_idx) * state_stride;
+    const float* w_row = w + size_t(channel_idx) * kernel_size;
+    const uint8_t* cur_state = state_in_place ? next_state : state_in;
+
+    for (uint32_t token_idx = 0; token_idx < suffix_len; ++token_idx) {
+        size_t in_proj_idx = size_t(token_idx) * in_proj_stride + channel_idx;
+        float pre_conv_gate = read_elem(in_proj, dtype, in_proj_idx);
+        float post_conv_gate = read_elem(in_proj, dtype, in_proj_idx + model_dim);
+        float x_in = read_elem(in_proj, dtype, in_proj_idx + 2u * model_dim);
+        float x = x_in * pre_conv_gate;
+
+        float acc = has_bias ? b[channel_idx] : 0.0f;
+        for (uint32_t tap = 0; tap < tap_count; ++tap) {
+            float sample = read_elem(cur_state, dtype, state_offset + tap);
+            acc += w_row[tap] * sample;
+        }
+        acc += w_row[tap_count] * x;
+
+        float gated_output = acc * post_conv_gate;
+        write_elem(out, dtype, size_t(token_idx) * model_dim + channel_idx, gated_output);
+
+        if (tap_count > 0u) {
+            for (uint32_t tap = 0; tap + 1u < tap_count; ++tap) {
+                float s = read_elem(cur_state, dtype, state_offset + tap + 1u);
+                write_elem(next_state, dtype, state_offset + tap, s);
+            }
+            write_elem(next_state, dtype, state_offset + tap_count - 1u, x);
+        }
+        cur_state = next_state;
+    }
+}
+
+extern "C" __global__ void rocm_attention_prepare(
+    const uint8_t* qkvg,
+    uint8_t* queries,
+    uint8_t* keys,
+    uint8_t* values,
+    const float* cosines,
+    const float* sines,
+    uint32_t num_q_heads,
+    uint32_t num_kv_heads,
+    uint32_t head_dim,
+    uint32_t rope_dim,
+    uint32_t kv_token_offset,
+    uint32_t input_row_stride,
+    uint32_t batch_dim,
+    uint32_t dtype,
+    uint32_t flags
+) {
+    bool has_kv = (flags & 1u) != 0;
+    bool has_rope = (flags & 2u) != 0;
+    uint32_t total_heads = has_kv ? (num_q_heads + num_kv_heads * 2u) : num_q_heads;
+    uint32_t total = batch_dim * total_heads * head_dim;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    uint32_t head_dim_idx = idx % head_dim;
+    uint32_t temp = idx / head_dim;
+    uint32_t head_idx = temp % total_heads;
+    uint32_t batch_idx = temp / total_heads;
+
+    size_t qkvg_head_off = size_t(batch_idx) * input_row_stride + size_t(head_idx) * head_dim;
+    bool is_query = !has_kv || (head_idx < num_q_heads);
+    bool is_key = has_kv && (head_idx >= num_q_heads) && (head_idx < num_q_heads + num_kv_heads);
+
+    float element = read_elem(qkvg, dtype, qkvg_head_off + head_dim_idx);
+    if (has_rope && head_dim_idx < rope_dim && (is_query || is_key)) {
+        uint32_t half_rope_dim = rope_dim / 2u;
+        uint32_t paired_idx = (head_dim_idx < half_rope_dim) ? (head_dim_idx + half_rope_dim) : (head_dim_idx - half_rope_dim);
+        float paired = read_elem(qkvg, dtype, qkvg_head_off + paired_idx);
+        float signed_paired = (head_dim_idx < half_rope_dim) ? -paired : paired;
+        float cos_val = cosines[size_t(batch_idx) * rope_dim + head_dim_idx];
+        float sin_val = sines[size_t(batch_idx) * rope_dim + head_dim_idx];
+        element = round_to_dtype(element * cos_val + signed_paired * sin_val, dtype);
+    }
+
+    if (is_query) {
+        size_t query_offset = (size_t(head_idx) * batch_dim + batch_idx) * head_dim + head_dim_idx;
+        write_elem(queries, dtype, query_offset, element);
+    } else if (is_key) {
+        size_t key_offset = (size_t(kv_token_offset + batch_idx) * num_kv_heads + (head_idx - num_q_heads)) * head_dim + head_dim_idx;
+        write_elem(keys, dtype, key_offset, element);
+    } else {
+        size_t value_offset = (size_t(kv_token_offset + batch_idx) * num_kv_heads + (head_idx - num_q_heads - num_kv_heads)) * head_dim + head_dim_idx;
+        write_elem(values, dtype, value_offset, element);
     }
 }

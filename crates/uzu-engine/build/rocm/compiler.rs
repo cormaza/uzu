@@ -743,6 +743,7 @@ impl RocmCompiler {
     ) -> TokenStream {
         let hook_fn = match kernel_name {
             "Activation" => Some("try_encode_activation"),
+            "ActivationTransform" => Some("try_encode_activation_transform"),
             "TensorAddBias" => Some("try_encode_tensor_add_bias"),
             "TensorAddScale" => Some("try_encode_tensor_add_scale"),
             "LogitTransform" => Some("try_encode_logit_transform"),
@@ -754,7 +755,11 @@ impl RocmCompiler {
             "KVCacheUpdate" => Some("try_encode_kv_cache_update"),
             "GatedActMul" => Some("try_encode_gated_act_mul"),
             "AttentionSinglePass" => Some("try_encode_attention_single_pass"),
+            "AttentionPrepare" => Some("try_encode_attention_prepare"),
             "InputEmbeddingLookup" => Some("try_encode_input_embedding_lookup"),
+            "ShortConvPack" => Some("try_encode_short_conv_pack"),
+            "ShortConvPrefill" => Some("try_encode_short_conv_prefill"),
+            "ShortConvDecode" => Some("try_encode_short_conv_decode"),
             _ => None,
         };
         let Some(hook_fn) = hook_fn else {

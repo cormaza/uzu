@@ -388,7 +388,7 @@ impl MatmulKernel for MatmulRocmKernel {
                         (&mut p_sc as *mut f32).cast(),
                         (&mut p_hsc as *mut u32).cast(),
                     ];
-                    let total = m.saturating_mul(n);
+                    let total = m.saturating_mul(n).saturating_mul(8);
                     let block = 128u32;
                     let grid = total.div_ceil(block);
                     stream
