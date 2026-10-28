@@ -15,9 +15,10 @@ keywords.workspace = true
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [features]
-default = ["backend-cpu", "backend-metal", "capability-grammar"]
+default = ["backend-cpu", "backend-metal", "backend-rocm", "capability-grammar"]
 backend-cpu = ["uzu-engine/cpu"]
 backend-metal = ["uzu-engine/metal"]
+backend-rocm = ["uzu-engine/rocm"]
 capability-grammar = ["uzu-engine/grammar"]
 bindings = [
     "bindings-uniffi",

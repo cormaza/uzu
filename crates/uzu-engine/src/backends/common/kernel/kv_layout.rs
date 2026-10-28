@@ -19,7 +19,7 @@ impl Int8KVLayout {
     }
 
     /// Scales: [key block][head][key in block].
-    #[cfg(backend = "cpu")]
+    #[cfg(any(backend = "cpu", backend = "rocm"))]
     pub fn scale_index(
         &self,
         key: u32,
@@ -43,7 +43,7 @@ impl Int8KVLayout {
         self.code_bytes(keys) / self.head_dim as usize * size_of::<bf16>()
     }
 
-    #[cfg(backend = "cpu")]
+    #[cfg(any(backend = "cpu", backend = "rocm"))]
     pub fn k_code_index(
         &self,
         key: u32,
@@ -58,7 +58,7 @@ impl Int8KVLayout {
                 as usize
     }
 
-    #[cfg(backend = "cpu")]
+    #[cfg(any(backend = "cpu", backend = "rocm"))]
     pub fn v_code_index(
         &self,
         key: u32,
@@ -79,7 +79,7 @@ impl Int8KVLayout {
     }
 }
 
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "cpu", backend = "rocm"))]
 fn mma_lane(
     row: u32,
     group: u32,

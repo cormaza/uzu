@@ -4,6 +4,8 @@ pub(crate) mod common;
 pub(crate) mod cpu;
 #[cfg(backend = "metal")]
 pub(crate) mod metal;
+#[cfg(backend = "rocm")]
+pub(crate) mod rocm;
 
 pub use common::Backend;
 
@@ -20,6 +22,8 @@ pub async fn select_backend<S: BackendSelection>(
 ) -> Result<S::Output, S::Error> {
     let default = if cfg!(backend = "metal") {
         "metal"
+    } else if cfg!(backend = "rocm") {
+        "rocm"
     } else if cfg!(backend = "cpu") {
         "cpu"
     } else {
@@ -32,6 +36,8 @@ pub async fn select_backend<S: BackendSelection>(
         "cpu" => selection.select::<cpu::Cpu>().await,
         #[cfg(backend = "metal")]
         "metal" => selection.select::<metal::Metal>().await,
+        #[cfg(backend = "rocm")]
+        "rocm" => selection.select::<rocm::Rocm>().await,
         _ => Err(unknown),
     }
 }

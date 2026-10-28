@@ -15,11 +15,11 @@ use crate::{
     encodable_block::batch_topology::BatchTopology,
 };
 
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "cpu", backend = "rocm"))]
 mod gumbel;
 mod prng;
 
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "cpu", backend = "rocm"))]
 pub use gumbel::{gumbel_float, revidx};
 pub use prng::PRng;
 

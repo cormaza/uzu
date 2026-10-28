@@ -3,6 +3,7 @@ tools = "run --quiet -p cli-tools --"
 
 [env]
 RUST_TEST_THREADS = "1"
+RUSTC_BOOTSTRAP = "1"
 
 [target.wasm32-wasip1-threads]
 # threads=y         — wasmtime need this flag to use threads

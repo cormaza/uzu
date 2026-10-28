@@ -11,8 +11,10 @@ pub use d_ops::MatmulDOps;
 pub use kernel::MatmulKernel;
 pub use matmul_a::{Int8CodeLayout, MatmulA};
 pub use matmul_b::{MatmulB, QuantizedB, QuantizedCorrection};
-#[cfg(backend = "metal")]
-pub use matmul_b::{TRELLIS_CODES_TAIL_BYTES, TrellisFormat};
+#[cfg(any(backend = "metal", backend = "rocm"))]
+pub use matmul_b::TRELLIS_CODES_TAIL_BYTES;
+#[cfg(any(backend = "metal", all(test, backend = "rocm")))]
+pub use matmul_b::TrellisFormat;
 pub use output::{MatmulOutput, MatmulOutputError};
 pub use routing::{ActivationFormat, MatmulShape};
 

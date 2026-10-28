@@ -132,3 +132,40 @@ async fn test_engine_text_to_speech() {
     let path = dirs::home_dir().unwrap().join("Desktop").join("output.wav").to_string_lossy().to_string();
     result.pcm_batch.save_as_wav(path).unwrap();
 }
+
+#[tokio::test]
+async fn test_rocm_engine_and_mirai_registry() {
+    use uzu_engine::backends::{Backend, BackendSelection, select_backend};
+
+    struct CheckBackend;
+    impl BackendSelection for CheckBackend {
+        type Output = &'static str;
+        type Error = String;
+
+        async fn select<B: Backend>(self) -> Result<Self::Output, Self::Error> {
+            let _engine = uzu_engine::engine::Engine::<B>::new().await.map_err(|e| e.to_string())?;
+            Ok(B::NAME)
+        }
+    }
+
+    let selected_backend = select_backend(CheckBackend, "No backend available".to_string())
+        .await
+        .expect("select_backend failed");
+    println!("Selected uzu_engine backend: {selected_backend}");
+    assert_eq!(selected_backend, "rocm");
+
+    let config = EngineConfig::default();
+    let engine = Engine::new(config).await.expect("Engine::new failed on Linux with ROCm backend");
+
+    let models = engine.models().await.expect("engine.models() failed");
+    println!("Resolved {} models from MiraiRegistry on Linux ROCm", models.len());
+    assert!(!models.is_empty(), "Expected non-empty model catalog from MiraiRegistry");
+
+    let model = engine
+        .model("alibaba:qwen3.5:0.8b:mirai:mirai-m:4".to_string())
+        .await
+        .expect("engine.model lookup failed")
+        .expect("Expected alibaba:qwen3.5:0.8b:mirai:mirai-m:4 in MiraiRegistry");
+    println!("Resolved model: id={}, name={}, repo_ids={:?}", model.identifier, model.name(), model.repo_ids());
+    assert_eq!(model.identifier, "alibaba:qwen3.5:0.8b:mirai:mirai-m:4");
+}

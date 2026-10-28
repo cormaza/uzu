@@ -10,6 +10,9 @@ mod cpu;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal;
 
+#[cfg(all(feature = "rocm", target_os = "linux"))]
+mod rocm;
+
 fn main() -> anyhow::Result<ExitCode> {
     println!("cargo::rerun-if-changed=build");
 
@@ -20,7 +23,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH")?;
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
 
-    println!("cargo::rustc-check-cfg=cfg(backend, values(\"cpu\", \"metal\"))");
+    println!("cargo::rustc-check-cfg=cfg(backend, values(\"cpu\", \"metal\", \"rocm\"))");
 
     let backend_cpu = cfg!(feature = "cpu");
     if backend_cpu {
@@ -30,6 +33,11 @@ fn main() -> anyhow::Result<ExitCode> {
     let backend_metal = cfg!(feature = "metal") && matches!(target_os.as_ref(), "macos" | "ios" | "tvos" | "visionos");
     if backend_metal {
         println!("cargo::rustc-cfg=backend=\"metal\"");
+    }
+
+    let backend_rocm = cfg!(feature = "rocm") && target_os == "linux";
+    if backend_rocm {
+        println!("cargo::rustc-cfg=backend=\"rocm\"");
     }
 
     let grammar = cfg!(feature = "grammar") && target_arch != "wasm32";
@@ -63,6 +71,11 @@ fn main() -> anyhow::Result<ExitCode> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     if backend_metal {
         compilers.push(Box::new(metal::MetalCompiler::new()?));
+    }
+
+    #[cfg(all(feature = "rocm", target_os = "linux"))]
+    if backend_rocm {
+        compilers.push(Box::new(rocm::RocmCompiler::new()?));
     }
 
     if compilers.is_empty() {

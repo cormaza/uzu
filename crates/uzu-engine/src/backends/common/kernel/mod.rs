@@ -1,4 +1,4 @@
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "cpu", backend = "rocm"))]
 use std::{convert::Infallible, marker::PhantomData};
 
 use crate::backends::common::Backend;
@@ -11,7 +11,7 @@ pub mod gated_act_mul;
 pub mod kv_layout;
 pub mod matmul;
 pub mod radix_top_k_small;
-#[cfg(any(backend = "cpu", test))]
+#[cfg(any(backend = "cpu", backend = "rocm", test))]
 mod trellis;
 
 pub use activation_transform::{ActivationQuantization, ActivationTransform};
@@ -20,7 +20,7 @@ pub use attention::{
 };
 pub use gated_act_mul::{GatedActMul, GatedActMulSettings};
 
-#[cfg(any(backend = "cpu", test))]
+#[cfg(any(backend = "cpu", backend = "rocm", test))]
 pub use crate::backends::common::kernel::trellis::mixing_dimension;
 
 include!(concat!(env!("OUT_DIR"), "/traits.rs"));
@@ -36,7 +36,7 @@ pub trait Kernels: Sized {
     type RadixTopKSmall: radix_top_k_small::RadixTopKSmall<Backend = Self::Backend>;
 }
 
-#[cfg(backend = "cpu")]
+#[cfg(any(backend = "cpu", backend = "rocm"))]
 pub struct Unsupported<B: Backend> {
     never: Infallible,
     _marker: PhantomData<fn() -> B>,
