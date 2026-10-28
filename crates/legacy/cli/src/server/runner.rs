@@ -14,6 +14,7 @@ use tokio::{
     io::{AsyncRead, ReadBuf},
     sync::Mutex,
 };
+use tokio_stream::StreamExt;
 use uzu::{
     engine::{Engine, EngineConfig},
     types::session::chat::ChatConfig,
@@ -22,7 +23,7 @@ use uzu::{
 use crate::{
     common::thinking::ThinkingSupport,
     server::{
-        ServerState, handle_chat_completions, handle_models,
+        ActiveModelSession, ServerState, handle_chat_completions, handle_models,
         log::{self, FileLogger},
         request_info::RequestInfo,
     },
@@ -151,6 +152,61 @@ impl Fairing for RequestLoggingFairing {
     }
 }
 
+pub async fn resolve_and_prepare_model(
+    engine: &Engine,
+    model: &str,
+    show_spinner: bool,
+) -> Result<ActiveModelSession> {
+    let resolved = if let Some(exact) = engine.model(model.to_string()).await? {
+        exact
+    } else {
+        let mut updates = engine.catalog_subscribe();
+        while engine.catalog_is_refreshing() {
+            if updates.next().await.is_none() {
+                break;
+            }
+        }
+        let query = model.to_lowercase();
+        engine
+            .models()
+            .await?
+            .into_iter()
+            .find(|candidate| {
+                candidate.identifier.to_lowercase().contains(&query)
+                    || candidate.name().to_lowercase().contains(&query)
+            })
+            .with_context(|| format!("Model not found: {model}"))?
+    };
+
+    if show_spinner {
+        let spinner = ProgressBar::new_spinner();
+        spinner.enable_steady_tick(Duration::from_millis(100));
+        spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
+        spinner.set_message(format!("Preparing model: {}", resolved.identifier));
+        let downloader = engine.download(&resolved).await.context("Failed to start model download")?;
+        while let Some(update) = downloader.next().await {
+            spinner.set_message(format!("Downloading {}: {:.0}%", resolved.identifier, update.progress() * 100.0));
+        }
+        spinner.finish_with_message(format!("Loaded: {}", resolved.identifier));
+    } else if resolved.is_downloadable() {
+        tracing::info!("Preparing model: {}", resolved.identifier);
+        let downloader = engine.download(&resolved).await.context("Failed to start model download")?;
+        while let Some(update) = downloader.next().await {
+            tracing::debug!("Downloading {}: {:.0}%", resolved.identifier, update.progress() * 100.0);
+        }
+        tracing::info!("Loaded model: {}", resolved.identifier);
+    }
+
+    let thinking_support = ThinkingSupport::for_model(&resolved);
+    let session =
+        engine.chat(resolved.clone(), ChatConfig::default()).await.context("Failed to create chat session")?;
+    Ok(ActiveModelSession {
+        model_name: resolved.identifier,
+        session: Arc::new(Mutex::new(session)),
+        thinking_support,
+    })
+}
+
 pub async fn run_server(
     model: String,
     host: String,
@@ -174,26 +230,11 @@ pub async fn run_server(
     let engine_config = EngineConfig::default().with_application_identifier("com.trymirai.cli".to_string());
     let engine = Engine::new(engine_config).await.context("Failed to create engine")?;
 
-    let resolved = engine.model(model.clone()).await?.with_context(|| format!("Model not found: {model}"))?;
-
-    let spinner = ProgressBar::new_spinner();
-    spinner.enable_steady_tick(Duration::from_millis(100));
-    spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
-    spinner.set_message(format!("Preparing model: {}", resolved.identifier));
-    let downloader = engine.download(&resolved).await.context("Failed to start model download")?;
-    while let Some(update) = downloader.next().await {
-        spinner.set_message(format!("Downloading {}: {:.0}%", resolved.identifier, update.progress() * 100.0));
-    }
-    spinner.finish_with_message(format!("Loaded: {}", resolved.identifier));
-
-    let thinking_support = ThinkingSupport::for_model(&resolved);
-    let session =
-        engine.chat(resolved.clone(), ChatConfig::default()).await.context("Failed to create chat session")?;
-    let model_name = resolved.identifier.clone();
+    let active_session = resolve_and_prepare_model(&engine, &model, true).await?;
+    let model_name = active_session.model_name.clone();
     let state = ServerState {
-        model_name: model_name.clone(),
-        session: Arc::new(Mutex::new(session)),
-        thinking_support,
+        engine,
+        active: Arc::new(Mutex::new(active_session)),
         prefix_cache,
     };
 

@@ -25,15 +25,21 @@ impl BackendSelection for DetectBackend {
 }
 
 fn print_usage() {
-    println!("Usage: cargo run -p uzu --example mirai_rocm_chat -- [OPTIONS]");
-    println!("   or: ./run_mirai.sh [OPTIONS]");
+    println!("Usage: ./run_mirai.sh [OPTIONS]");
+    println!("   or: cargo run --release -p uzu --example mirai_rocm_chat -- [OPTIONS]");
     println!();
-    println!("Options:");
+    println!("Modes:");
+    println!("  --serve, server         Start OpenAI-compatible HTTP server (/v1/chat/completions, /v1/models)");
     println!("  --list                  List all available models in MiraiRegistry");
     println!("  --search <QUERY>        Filter available models by substring (e.g. 'lfm' or 'qwen')");
+    println!("  --prompt <TEXT>         Run a single prompt and exit (omit for interactive chat)");
+    println!();
+    println!("Options:");
     println!("  --model <MODEL_ID>      Model ID or shorthand (default: {DEFAULT_MODEL_ID})");
-    println!("  --prompt <TEXT>         Run a single prompt and exit");
-    println!("  --system <TEXT>         Custom system prompt (default: 'You are a helpful assistant.')");
+    println!("  --host <ADDR>           Bind address for --serve (default: 127.0.0.1)");
+    println!("  --port <PORT>           Port for --serve (default: 8000)");
+    println!("  --no-prefix-cache       Disable prefix cache reuse in --serve mode");
+    println!("  --system <TEXT>         Custom system prompt for CLI chat (default: 'You are a helpful assistant.')");
     println!("  --help, -h              Show this help message");
     println!();
     println!("Environment Variables:");

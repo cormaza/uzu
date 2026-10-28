@@ -513,10 +513,21 @@ impl Engine {
             return Ok(Some(model));
         }
 
-        let models = self.models().await?;
         let mut system = System::new();
         system.refresh_memory();
-        Ok(shorthand::resolve_model_shorthand(&models, &identifier, system.total_memory())?.cloned())
+        let memory_total = system.total_memory();
+        let mut updates = self.catalog_subscribe();
+        loop {
+            let refreshing = self.catalog_is_refreshing();
+            let models = self.models().await?;
+            let resolved = shorthand::resolve_model_shorthand(&models, &identifier, memory_total)?.cloned();
+            if resolved.is_some() || !refreshing {
+                return Ok(resolved);
+            }
+            if updates.next().await.is_none() {
+                return Ok(None);
+            }
+        }
     }
 
     #[bindings::export(Method)]

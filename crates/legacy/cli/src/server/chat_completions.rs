@@ -1219,7 +1219,28 @@ pub async fn handle_chat_completions(
         },
     };
 
-    let model = state.model_name.clone();
+    let (model, session, thinking_support) = {
+        let mut active = state.active.lock().await;
+        if let Some(requested_model) = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty())
+            && !requested_model.eq_ignore_ascii_case(&active.model_name)
+        {
+            if let Ok(resolved) = state.engine.model(requested_model.to_string()).await
+                && resolved.as_ref().is_some_and(|m| m.identifier == active.model_name)
+            {
+                // Requested model resolves to the currently loaded model.
+            } else {
+                match crate::server::resolve_and_prepare_model(&state.engine, requested_model, false).await {
+                    Ok(new_active) => {
+                        *active = new_active;
+                    },
+                    Err(error) => {
+                        return invalid_request_response("model", "model_not_found", error.to_string());
+                    },
+                }
+            }
+        }
+        (active.model_name.clone(), Arc::clone(&active.session), active.thinking_support)
+    };
     let created = request_info.created_at;
     let is_stream = request.stream.unwrap_or(false);
     let log = RequestLog::start(
@@ -1240,7 +1261,7 @@ pub async fn handle_chat_completions(
             return invalid_request_response("response_format", error.code(), error.message());
         },
     };
-    let messages = match build_messages(&request, state.thinking_support) {
+    let messages = match build_messages(&request, thinking_support) {
         Ok(messages) => messages,
         Err(error) => {
             let param = error.param();
@@ -1257,7 +1278,6 @@ pub async fn handle_chat_completions(
 
     let id = request_info.id.as_str().to_owned();
     if is_stream {
-        let session = Arc::clone(&state.session);
         let (sender, receiver) = mpsc::unbounded_channel::<Event>();
         tokio::spawn(
             run_stream(session, messages, config, id, model, created, state.prefix_cache, parameter_types, sender, log)
@@ -1266,7 +1286,6 @@ pub async fn handle_chat_completions(
         let body: Pin<Box<dyn Stream<Item = Event> + Send>> = Box::pin(UnboundedReceiverStream::new(receiver));
         ChatCompletionResult::Stream(EventStream::from(body))
     } else {
-        let session = Arc::clone(&state.session);
         let (sender, receiver) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(
             run_blocking(

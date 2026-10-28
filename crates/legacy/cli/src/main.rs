@@ -44,6 +44,7 @@ enum Commands {
         model_id: String,
     },
     ListModels,
+    #[command(visible_alias = "serve")]
     Server {
         /// Model identifier, repository ID, or local model directory.
         #[arg(long, value_name = "MODEL")]
